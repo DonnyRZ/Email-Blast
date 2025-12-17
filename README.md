@@ -1,76 +1,48 @@
-﻿# Mass Outreach Helper
+# Outreach Script
 
-This repository now includes a self-contained Python tool for sending personalized outreach emails from `donnyrp@steradian.co.id` (Postale.io SMTP) to the hospital list in `rs_online_1000.xlsx`.
+Python helper that turns the contact spreadsheets into personalized SMTP blasts from `donnyrp@steradian.co.id`. It uses Postale (`mail.postale.io`) and string templates, so everything stays lightweight and scriptable.
 
-## Features
-- Pure-Python Excel reader (no third-party packages) tuned for `rs_online_1000.xlsx`.
-- Recipient normalization with automatic deduplication by `Email Perusahaan`.
-- Text template rendering via `string.Template` with contextual placeholders (`$hospital`, `$city`, `$province`, `$owner`, etc.).
-- CLI controls for dry-runs, batching (`--pause`), limiting/offsetting recipients, and TLS mode selection.
-- Works with environment variables (`SMTP_USER`, `SMTP_PASSWORD`, `SMTP_HOST`, `SMTP_PORT`) so credentials never live in the repository.
+## Setup
+1. Install Python 3.10+.
+2. Copy `.env.example` to `.env` and fill in the real mailbox password. Use `SMTP_HOST=mail.postale.io` and `SMTP_PORT=587` unless Postale tells you otherwise.
+3. Edit `templates/outreach_email.txt` if you want different copy (placeholders such as `$hospital`, `$city`, `$owner`, `$director`, etc.).
 
-## Prerequisites
-- Python 3.10+ available on your machine (the standard Windows Store build works).
-- The Postale SMTP password for `donnyrp@steradian.co.id`.
-
-## Quick Start
-```powershell
-# (optional) load credentials into the environment for convenience
-$env:SMTP_USER = "donnyrp@steradian.co.id"
-$env:SMTP_PASSWORD = "<your-mailbox-password>"
-
-# Dry-run to preview the first few personalized messages
-python outreach.py --subject 'Collaboration with $hospital' --from-name "Donny at Steradian" --dry-run
-
-# Actually send to the first 50 test entries with 2 seconds between messages
-python outreach.py `
-  --subject 'Steradian support for $hospital' `
-  --from-name "Donny at Steradian" `
-  --reply-to "donnyrp@steradian.co.id" `
-  --limit 50 `
-  --pause 2.0
-```
-
-Prefer dot-env files? Copy `.env.example` to `.env`, fill in the real credentials, and the script will pick them up automatically before parsing CLI flags.
-
-### Testing with mock data
-To experiment without touching the production list, run the script against `test.xlsx`:
+## Default test run
+The script now points to `test.xlsx`, so you can fully exercise the pipeline without touching the real hospital list.
 
 ```powershell
-python outreach.py --subject 'Test send to $hospital' --dry-run
+# Preview the message without sending anything
+python outreach.py --subject 'Test send to tal' --from-name 'Donny at San' --dry-run
+
+# Send the actual test email (uses creds from .env)
+python outreach.py --subject 'Test send to tal' --from-name 'Donny at San' --reply-to 'donnyrp@steradian.co.id' --preview 0
 ```
 
-`test.xlsx` mirrors the real schema but points to dummy recipients so you can validate personalization, throttling, and SMTP connectivity safely. When you are ready to send to the full hospital list, simply add `--recipients rs_online_1000.xlsx`. If you rename the mock file, you can still use `--recipients` to point at it explicitly or fall back to `--use-test-data`.
+## Going live with rs_online_1000.xlsx
+1. Always dry-run first so you can double-check personalization.
+2. Remove `--dry-run` only when you’re ready to deliver.
 
-### Command reference
-| Flag | Description |
+```powershell
+# Dry-run against the production list
+python outreach.py --subject 'Steradian support for $hospital' --from-name 'Donny at Steradian' --recipients rs_online_1000.xlsx --dry-run --preview 3
+
+# Send to the first 100 contacts with a short pause
+python outreach.py --subject 'Steradian support for $hospital' --from-name 'Donny at Steradian' --recipients rs_online_1000.xlsx --reply-to 'donnyrp@steradian.co.id' --limit 100 --pause 2.0
+```
+
+## Handy switches
+| Flag | Meaning |
 | --- | --- |
-| `--subject` | Required subject template. Placeholders such as `$hospital`, `$city`, `$province`, `$owner`, `$director`, `$email`, plus slugified forms of every Excel column (e.g. `$rumah_sakit`, `$kab_kota`, `$email_perusahaan`). |
-| `--template` | Email body path (defaults to `templates/outreach_email.txt`). Use any placeholders from above. |
-| `--recipients` | Excel file path (`test.xlsx` by default while we are in testing mode). |
-| `--smtp-user / --smtp-password` | Override credentials if not set via env vars. Host/port default to `mail.postale.io:587`. |
-| `--implicit-tls` | Switches to implicit TLS (port 465). Otherwise STARTTLS on 587 is used. |
-| `--from-name`, `--reply-to` | Customize headers. |
-| `--limit`, `--skip` | Control slices of the recipient list. Useful for batching across multiple days. |
-| `--pause` | Seconds to sleep between sends (prevents hitting rate limits). |
-| `--use-test-data` | Swap to `test.xlsx` for safe dry runs without touching the production recipient list. |
-| `--dry-run`, `--preview` | Preview without connecting to SMTP. |
+| `--subject` | Subject template. Use placeholders like `$hospital`, `$city`, `$province`. |
+| `--template PATH` | Alternate body template file (defaults to `templates/outreach_email.txt`). |
+| `--recipients FILE` | Excel workbook. Defaults to `test.xlsx`; point it at `rs_online_1000.xlsx` when going live. |
+| `--pause` | Seconds to wait between messages. Helpful for rate limits. |
+| `--limit / --skip` | Batch sends by slicing the recipient list. |
+| `--dry-run` | Preview without touching SMTP. Combine with `--preview N` to control how many samples you see. |
+| `--implicit-tls` | Use port 465 instead of STARTTLS on 587 if Postale ever asks for it. |
 
-## Template customization
-Edit `templates/outreach_email.txt` or create additional files that follow the same placeholder syntax. Everything between `$` braces maps to either:
-- Canonical keys we add (`hospital`, `city`, `province`, `address`, `phone`, `owner`, `director`, `email`).
-- Slugified column names from the spreadsheet (`Alamat (Profile)` -> `$alamat_profile`, etc.).
-
-Because we use `Template.safe_substitute`, missing placeholders simply become empty strings, which is helpful for optional data points.
-
-## Sending tips
-- Use `--dry-run` before every campaign to double-check personalization.
-- Break large blasts into batches with `--limit`/`--skip` and keep at least 1-2 seconds between sends.
-- Monitor Postale's outbound limits; adjust `--pause` accordingly.
-- Keep the Excel file updated; the script automatically deduplicates repeated email addresses, so you can rerun without worrying about duplicates.
-
-## Troubleshooting
-- `Workbook ... does not exist`: verify `rs_online_1000.xlsx` lives next to `outreach.py` or pass `--recipients`.
-- `SMTPAuthenticationError`: ensure the correct mailbox password (normal password, not an app password) and confirm no 2FA restrictions are blocking SMTP.
-- Empty preview: the spreadsheet rows you selected might not have `Email Perusahaan` filled. Add addresses or adjust the list.
-
+## Tips & gotchas
+- Leave `.env` out of git (already handled by `.gitignore`). Never commit real credentials.
+- Missing placeholders resolve to empty strings, so optional data won’t break the send.
+- If you see `CERTIFICATE_VERIFY_FAILED`, confirm `SMTP_HOST` is `mail.postale.io`.
+- For any spreadsheet row with a blank `Email Perusahaan`, the script simply skips it.
