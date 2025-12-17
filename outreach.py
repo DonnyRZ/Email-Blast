@@ -2,6 +2,7 @@
 """Send personalized outreach emails to hospitals listed in rs_online_1000.xlsx."""
 
 import argparse
+import mimetypes
 import os
 import re
 import smtplib
@@ -168,6 +169,26 @@ def load_recipients(workbook_path: Path) -> List[Dict[str, str]]:
     return recipients
 
 
+def load_attachments(directory: Optional[Path]) -> List[Tuple[str, bytes, str, str]]:
+    """Load every regular file inside the directory into memory."""
+    attachments: List[Tuple[str, bytes, str, str]] = []
+    if not directory:
+        return attachments
+    directory = Path(directory)
+    if not directory.exists() or not directory.is_dir():
+        raise FileNotFoundError(f"Attachment directory {directory} does not exist or is not a folder.")
+    for path in sorted(directory.iterdir()):
+        if not path.is_file():
+            continue
+        mime_type, _ = mimetypes.guess_type(path.name)
+        if mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+        attachments.append((path.name, path.read_bytes(), maintype, subtype))
+    return attachments
+
+
 def format_sender_address(username: str, display_name: Optional[str]) -> str:
     if display_name:
         return f"{display_name} <{username}>"
@@ -199,6 +220,7 @@ def send_messages(
     recipients: List[Dict[str, str]],
     subject_template: Template,
     body_template: Template,
+    attachments: List[Tuple[str, bytes, str, str]],
     args: argparse.Namespace,
 ) -> None:
     connection_cls = smtplib.SMTP_SSL if args.implicit_tls else smtplib.SMTP
@@ -207,32 +229,49 @@ def send_messages(
     successes = 0
     failures: List[Tuple[str, str]] = []
 
-    with connection_cls(args.smtp_host, args.smtp_port, timeout=args.timeout) as client:
-        if not args.implicit_tls:
-            client.starttls(context=ssl_context)
-        client.login(args.smtp_user, args.smtp_password)
+    def send_one(recipient: Dict[str, str]) -> None:
+        msg = EmailMessage()
+        msg["From"] = format_sender_address(args.smtp_user, args.from_name)
+        msg["To"] = recipient["email"]
+        msg["Subject"] = subject_template.safe_substitute(recipient)
+        if args.reply_to:
+            msg["Reply-To"] = args.reply_to
+        msg.set_content(body_template.safe_substitute(recipient))
+        for filename, data, maintype, subtype in attachments:
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
 
-        for idx, recipient in enumerate(recipients, start=1):
-            subject = subject_template.safe_substitute(recipient)
-            body = body_template.safe_substitute(recipient)
-            msg = EmailMessage()
-            msg["From"] = format_sender_address(args.smtp_user, args.from_name)
-            msg["To"] = recipient["email"]
-            msg["Subject"] = subject
-            if args.reply_to:
-                msg["Reply-To"] = args.reply_to
-            msg.set_content(body)
-
+        retries = args.retries
+        attempt = 0
+        while True:
+            attempt += 1
             try:
-                client.send_message(msg)
-                successes += 1
-                print(f"[{idx}/{total}] Sent {recipient['email']}")
+                with connection_cls(args.smtp_host, args.smtp_port, timeout=args.timeout) as client:
+                    if not args.implicit_tls:
+                        client.starttls(context=ssl_context)
+                    client.login(args.smtp_user, args.smtp_password)
+                    client.send_message(msg)
+                return
             except Exception as exc:
-                reason = str(exc)
-                failures.append((recipient["email"], reason))
-                print(f"[{idx}/{total}] Failed {recipient['email']}: {reason}", file=sys.stderr)
-            if args.pause and idx < total:
-                time.sleep(args.pause)
+                if attempt > retries:
+                    raise
+                backoff = args.retry_delay * attempt
+                print(
+                    f"Retrying {recipient['email']} after error: {exc}. Next attempt in {backoff:.1f}s.",
+                    file=sys.stderr,
+                )
+                time.sleep(backoff)
+
+    for idx, recipient in enumerate(recipients, start=1):
+        try:
+            send_one(recipient)
+            successes += 1
+            print(f"[{idx}/{total}] Sent {recipient['email']}")
+        except Exception as exc:
+            reason = str(exc)
+            failures.append((recipient["email"], reason))
+            print(f"[{idx}/{total}] Failed {recipient['email']}: {reason}", file=sys.stderr)
+        if args.pause and idx < total:
+            time.sleep(args.pause)
 
     print(f"Done. Success: {successes}, Failed: {len(failures)}.")
     if failures:
@@ -273,11 +312,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--from-name", help="Optional display name for the From header.")
     parser.add_argument("--reply-to", help="Optional Reply-To address.")
-    parser.add_argument("--pause", type=float, default=1.5, help="Seconds to pause between emails.")
+    parser.add_argument("--pause", type=float, default=15.0, help="Seconds to pause between emails.")
+    parser.add_argument("--retries", type=int, default=2, help="Number of times to retry a failed send per recipient.")
+    parser.add_argument("--retry-delay", type=float, default=5.0, help="Base seconds to wait before retrying (multiplied per attempt).")
     parser.add_argument(
         "--use-test-data",
         action="store_true",
         help="Use test.xlsx instead of rs_online_1000.xlsx for safe testing.",
+    )
+    parser.add_argument(
+        "--attachments-dir",
+        type=Path,
+        help="Attach every file in this directory to each email.",
     )
     parser.add_argument("--limit", type=int, help="Send to only the first N recipients.")
     parser.add_argument("--skip", type=int, default=0, help="Skip the first N recipients.")
@@ -321,6 +367,12 @@ def main() -> None:
         print("No recipients with valid email addresses were found.", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        attachments = load_attachments(args.attachments_dir)
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
+
     subject_template = Template(args.subject)
     body_template = Template(args.template.read_text(encoding="utf-8-sig"))
 
@@ -329,7 +381,7 @@ def main() -> None:
         print(f"Dry run complete. Use --dry-run off to send {len(recipients)} messages.")
         return
 
-    send_messages(recipients, subject_template, body_template, args)
+    send_messages(recipients, subject_template, body_template, attachments, args)
 
 
 if __name__ == "__main__":
